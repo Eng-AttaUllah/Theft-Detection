@@ -1,0 +1,10 @@
+# OpenCV 4.x keeps the HOG people detector and the Caffe loader, which the
+# default `hog` backend uses.  OpenCV 5 works too - the code then falls back
+# to the built-in `motion` detector (and `onnx` still works).
+#
+# This is the GUI build, so `--display` opens a real window.  On a server /
+# in Docker you can use the smaller headless build instead - it has no window
+# support, but `--web` (browser preview) keeps working:
+#   opencv-python-headless>=4.9,<5
+opencv-python>=4.9,<5
+numpy>=2.0

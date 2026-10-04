@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+alerts/
+samples/*.avi
+*.log

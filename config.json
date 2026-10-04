@@ -1,0 +1,105 @@
+{
+  "detector": {
+    "backend": "hog",
+    "conf_threshold": 0.40,
+    "model": "",
+    "weights": ""
+  },
+  "tracking": {
+    "iou_threshold": 0.30,
+    "max_misses": 20,
+    "min_hits": 3
+  },
+  "alerts": {
+    "directory": "alerts",
+    "cooldown_seconds": 8.0,
+    "save_snapshots": true,
+    "beep": true
+  },
+  "zones": [
+    {
+      "name": "entrance",
+      "kind": "entrance",
+      "severity": "low",
+      "points": [[0.0, 0.55], [0.13, 0.55], [0.13, 0.98], [0.0, 0.98]]
+    },
+    {
+      "name": "counter",
+      "kind": "register",
+      "severity": "high",
+      "points": [[0.55, 0.62], [0.97, 0.62], [0.97, 0.97], [0.55, 0.97]]
+    },
+    {
+      "name": "stock_room",
+      "kind": "restricted",
+      "severity": "high",
+      "points": [[0.0, 0.0], [0.14, 0.0], [0.14, 0.5], [0.0, 0.5]]
+    },
+    {
+      "name": "shelf_a",
+      "kind": "shelf",
+      "severity": "medium",
+      "points": [[0.2, 0.25], [0.5, 0.25], [0.5, 0.6], [0.2, 0.6]]
+    },
+    {
+      "name": "shelf_b",
+      "kind": "shelf",
+      "severity": "medium",
+      "points": [[0.55, 0.18], [0.85, 0.18], [0.85, 0.55], [0.55, 0.55]]
+    }
+  ],
+  "rules": {
+    "restricted_zone": {
+      "enabled": true,
+      "zone_kinds": ["restricted", "register"],
+      "min_dwell_seconds": 1.0
+    },
+    "loitering": {
+      "enabled": true,
+      "max_seconds": 10.0,
+      "max_radius": 60.0
+    },
+    "item_removal": {
+      "enabled": true,
+      "zone_kinds": ["shelf"],
+      "diff_threshold": 28,
+      "change_ratio": 0.010,
+      "largest_change_ratio": 0.015,
+      "hold_frames": 10,
+      "person_grace_seconds": 8.0,
+      "settle_seconds": 20.0,
+      "person_margin": 150,
+      "lost_person_seconds": 60.0,
+      "shadow_margin": 15,
+      "person_fill_ratio": 0.5,
+      "repeat_gap_seconds": 30.0,
+      "duplicate_overlap": 0.4
+    },
+    "unattended_object": {
+      "enabled": true,
+      "zone_kinds": ["shelf", "register"],
+      "hold_frames": 30,
+      "unattended_seconds": 10.0
+    },
+    "rapid_motion": {
+      "enabled": true,
+      "threshold": 9.0,
+      "min_frames": 3,
+      "person_margin": 150,
+      "zone_kinds": ["shelf", "register", "restricted"]
+    },
+    "crowd": {
+      "enabled": true,
+      "min_persons": 3,
+      "seconds": 2.0
+    },
+    "camera_tamper": {
+      "enabled": true,
+      "min_brightness": 22.0,
+      "max_brightness": 238.0,
+      "min_sharpness": 6.0,
+      "static_seconds": 8.0,
+      "min_frames": 8
+    }
+  }
+}
