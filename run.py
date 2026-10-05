@@ -45,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="config JSON (default: config.json next to this script)")
     p.add_argument("--detector", choices=["hog", "motion", "onnx", "caffe"],
                    help="override the person detector backend")
+    p.add_argument("--tracker", choices=["iou", "bytetrack", "botsort"],
+                   help="override the multi-object tracker "
+                        "(bytetrack default, botsort adds appearance re-ID)")
     p.add_argument("-d", "--display", action="store_true",
                    help="show an annotated window (needs a desktop session)")
     p.add_argument("--web", metavar="PORT", nargs="?", type=int, const=8080, default=None,
@@ -74,6 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
 def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     if args.detector:
         cfg.detector.backend = args.detector
+    if getattr(args, "tracker", None):
+        cfg.tracking.algorithm = args.tracker
     if args.alert_dir:
         cfg.alerts.directory = args.alert_dir
     if args.no_snapshots:
@@ -129,7 +134,8 @@ def main(argv: list[str] | None = None) -> int:
 
     alerts = AlertManager(cfg.alerts)
     print(f"theft detector {__version__} | source={source} | "
-          f"detector={cfg.detector.backend} | rules={','.join(sorted(cfg.enabled_rules()))}")
+          f"detector={cfg.detector.backend} | tracker={cfg.tracking.algorithm} | "
+          f"rules={','.join(sorted(cfg.enabled_rules()))}")
 
     pipe = Pipeline(
         cfg,

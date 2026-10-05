@@ -14,10 +14,12 @@ import numpy as np
 
 from .alerts import AlertManager, Event
 from .behaviors import FrameContext, Rule, ZoneBackgrounds, build_rules
+from .bytetrack import build_tracker
 from .config import Config
+from .confidence import Assessment, TheftConfidence
 from .detectors import build_detector
-from .tracker import Tracker
-from .viz import draw_hud, draw_tracks, draw_zones, event_line
+from .objects import ObjectTracker
+from .viz import draw_hud, draw_objects, draw_tracks, draw_zones, event_line
 from .webpreview import PreviewServer
 from .zones import resolve_zones
 
@@ -80,7 +82,12 @@ class Pipeline:
         self.verbose = verbose
 
         self.detector = build_detector(config.detector)
-        self.tracker = Tracker(config.tracking)
+        self.tracker = build_tracker(config.tracking)
+        self.object_tracker = ObjectTracker(
+            config.tracking, config.rule("object_taken")
+        )
+        self.fuser = TheftConfidence(config.confidence)
+        self.assessment: Assessment | None = None
         self.alerts = alert_manager or AlertManager(config.alerts)
 
         shared: dict[str, Any] = {
@@ -239,10 +246,18 @@ class Pipeline:
                 flow_mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
             self.flow_prev = small.copy()
 
+        # --- stage 1+2: YOLO person/object detection -> ByteTrack / BoT-SORT --
         detections = self.detector(frame)
+        person_dets = [d for d in detections if d.label == "person"]
+        object_dets = [d for d in detections if d.label != "person"]
         timestamp = self._timestamp()
-        tracks = self.tracker.update(detections, timestamp)
+        tracks = self.tracker.update(person_dets, timestamp, frame)
         confirmed = self.tracker.confirmed()
+
+        # --- stage 3: person IDs + object IDs -------------------------------
+        objects = self.object_tracker.update(
+            object_dets, confirmed, self.config.zones, timestamp
+        )
 
         # a track that just died marks "that spot is empty now" in the motion
         # background model, which prevents ghost people from lingering
@@ -279,6 +294,7 @@ class Pipeline:
             zones=self.config.zones,
             tracks=confirmed,
             detections=detections,
+            objects=objects,
             person_mask=person_mask,
             flow_mag=flow_mag,
             flow_scale=scale,
@@ -295,6 +311,13 @@ class Pipeline:
                 if self.verbose:
                     print(f"[error] rule {rule.name} failed: {exc}", file=sys.stderr)
 
+        # --- stage 5: fuse the rule hits into one theft confidence ----------
+        assessment = self.fuser.update(events, ctx.timestamp)
+        self.assessment = assessment
+        if assessment.event is not None:
+            events.append(assessment.event)
+
+        # --- stage 6: alerts -------------------------------------------------
         for ev in events:
             if self.alerts.emit(ev, frame, confirmed):
                 self.recent.append((event_line(ev), ev.severity))
@@ -309,6 +332,7 @@ class Pipeline:
         busy = {z.name for z in self.config.zones if ctx and ctx.person_near(z, margin=10)}
         draw_zones(frame, self.config.zones, busy)
         draw_tracks(frame, ctx.tracks if ctx else [])
+        draw_objects(frame, ctx.objects if ctx else [])
         draw_hud(
             frame,
             fps=fps,
@@ -317,6 +341,10 @@ class Pipeline:
             alert_count=len(self.alerts.emitted),
             recent=self.recent,
             zones_busy=busy,
+            tracker=getattr(self.tracker, "name", "iou"),
+            theft=(self.assessment.score if self.assessment else 0.0),
+            theft_level=(self.assessment.level if self.assessment else "clear"),
+            objects=len(ctx.objects) if ctx else 0,
         )
         return frame
 

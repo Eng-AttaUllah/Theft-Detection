@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from .config import TrackingConfig
 from .detectors import Detection
 
@@ -29,6 +31,7 @@ class Track:
     misses: int = 0
     start_time: float = 0.0
     last_time: float = 0.0
+    label: str = "person"
     history: list[tuple[float, int, int]] = field(default_factory=list)
 
     @property
@@ -68,7 +71,10 @@ class Tracker:
 
     # ------------------------------------------------------------------ #
     def update(
-        self, detections: list[Detection], timestamp: float
+        self,
+        detections: list[Detection],
+        timestamp: float,
+        frame: np.ndarray | None = None,       # unused: this tracker is geometry only
     ) -> list[Track]:
         matched_track: set[int] = set()
         matched_det: set[int] = set()
@@ -88,6 +94,7 @@ class Tracker:
             det = detections[di]
             track.box = det.box
             track.confidence = det.confidence
+            track.label = det.label
             track.hits += 1
             track.misses = 0
             track.last_time = timestamp
@@ -109,6 +116,7 @@ class Tracker:
                     track_id=self._next_id,
                     box=det.box,
                     confidence=det.confidence,
+                    label=det.label,
                     hits=1,
                     misses=0,
                     start_time=timestamp,

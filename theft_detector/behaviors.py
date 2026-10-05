@@ -12,6 +12,7 @@ import numpy as np
 
 from .alerts import Event
 from .detectors import Detection
+from .objects import CARRIED, ObjectTrack
 from .tracker import Track
 from .zones import Zone
 
@@ -29,6 +30,7 @@ class FrameContext:
     zones: list[Zone]
     tracks: list[Track]                      # confirmed tracks only
     detections: list[Detection] = field(default_factory=list)
+    objects: list[ObjectTrack] = field(default_factory=list)   # object-ID stage
     person_mask: np.ndarray | None = None    # uint8, full resolution
     flow_mag: np.ndarray | None = None       # optical flow magnitude map
     flow_scale: float = 1.0                  # full-res coords -> flow coords
@@ -90,6 +92,7 @@ class ZoneState:
     occupancy: float = 0.0
     changed_ratio: float = 0.0
     largest_ratio: float = 0.0
+    coherence: float = 0.0               # largest blob / all changed pixels
     observed: bool = True                  # enough unmasked pixels to judge
     consumed_by: str | None = None
     quiet: int = 0                         # frames without change evidence
@@ -107,6 +110,10 @@ class ZoneBackgrounds:
         "diff_threshold": 28,
         "change_ratio": 0.010,
         "largest_change_ratio": 0.015,
+        # an object vanishing leaves ONE coherent hole; a person shuffling out
+        # of frame, lighting and sensor noise leave scattered fragments. The
+        # real removal measures ~1.0 here, a person-shaped ghost ~0.7.
+        "min_blob_coherence": 0.80,
         "bg_alpha": 0.06,
         "freeze_ratio": 0.03,
         # how close (px) somebody's *feet* must be to the zone to count as
@@ -284,16 +291,19 @@ class ZoneBackgrounds:
         state.changed_ratio = float(changed.sum()) / valid_area
 
         # largest coherent changed blob -> an object, not noise/lighting
+        changed_px = int(changed.sum())
         largest = 0
-        if changed.any():
+        if changed_px:
             num, _, stats, _ = cv2.connectedComponentsWithStats(changed.astype(np.uint8), 8)
             if num > 1:
                 largest = int(stats[1:, cv2.CC_STAT_AREA].max())
         state.largest_ratio = largest / zone_area
+        state.coherence = (largest / changed_px) if changed_px else 0.0
 
         is_change = (
             state.changed_ratio >= float(self.p["change_ratio"])
             and state.largest_ratio >= float(self.p["largest_change_ratio"])
+            and state.coherence >= float(self.p["min_blob_coherence"])
         )
 
         if is_change:
@@ -780,6 +790,70 @@ class CameraTamperRule(Rule):
 
 
 # --------------------------------------------------------------------------- #
+class ObjectTakenRule(Rule):
+    """An object-id left the shelf it was anchored to.
+
+    This is the sharp end of the pipeline: *person id* + *object id* + *where
+    the object came from*. It only fires when an object detector (``onnx`` /
+    ``caffe``) is running - with ``hog``/``motion`` there are no object ids and
+    the rule simply never sees anything.
+    """
+
+    name = "object_taken"
+
+    def __init__(self, params: dict[str, Any], shared: dict[str, Any]) -> None:
+        super().__init__(params)
+        self._done: dict[int, float] = {}
+
+    def update(self, ctx: FrameContext) -> list[Event]:
+        if not ctx.objects:
+            return []
+        carry_min = float(self.params.get("min_carry_seconds", 2.0))
+        leave_margin = int(self.params.get("leave_margin", 60))
+        kinds = self.params.get("zone_kinds") or ["shelf", "register"]
+        zones = {z.name: z for z in ctx.zones if z.kind in kinds}
+        events: list[Event] = []
+
+        for obj in ctx.objects:
+            if obj.object_id in self._done:
+                continue
+            if not obj.anchor_zone or obj.anchor_zone not in zones:
+                continue                       # it never started on a watched shelf
+            zone = zones[obj.anchor_zone]
+
+            held_since = obj.carried_since
+            carried = held_since is not None and (
+                ctx.timestamp - held_since
+            ) >= carry_min and obj.carrier is not None
+            vanished = (not obj.alive) and obj.state == CARRIED
+            if not (carried and (vanished or not obj.in_zone(zone, leave_margin))):
+                continue
+
+            self._done[obj.object_id] = ctx.timestamp
+            who = f" by person #{obj.carrier}" if obj.carrier else ""
+            how = "disappeared while held" if vanished else "left"
+            events.append(
+                Event(
+                    rule=self.name,
+                    severity=zone.severity,
+                    zone=zone.name,
+                    timestamp=ctx.timestamp,
+                    track_ids=[obj.carrier] if obj.carrier else [],
+                    confidence=0.8,
+                    message=(
+                        f"{obj.label} '{obj.anchor_zone}' was {how}{who} "
+                        f"(object #{obj.object_id})"
+                    ),
+                )
+            )
+
+        if len(self._done) > 400:
+            for key in sorted(self._done, key=self._done.get)[:100]:
+                del self._done[key]
+        return events
+
+
+# --------------------------------------------------------------------------- #
 RULE_CLASSES: dict[str, type[Rule]] = {
     RestrictedZoneRule.name: RestrictedZoneRule,
     LoiteringRule.name: LoiteringRule,
@@ -788,6 +862,7 @@ RULE_CLASSES: dict[str, type[Rule]] = {
     RapidMotionRule.name: RapidMotionRule,
     CrowdRule.name: CrowdRule,
     CameraTamperRule.name: CameraTamperRule,
+    ObjectTakenRule.name: ObjectTakenRule,
 }
 
 

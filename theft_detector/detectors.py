@@ -268,8 +268,82 @@ def decode_yolo(
     return boxes[mask], best[mask], class_ids[mask].astype(np.int32)
 
 
+# --------------------------------------------------------------------------- #
+# Class names - COCO (YOLO) and Pascal VOC (MobileNet-SSD) orders. A custom
+# model can override them with detector.class_names (one label per line).
+COCO_NAMES: tuple[str, ...] = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag",
+    "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon",
+    "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot",
+    "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
+    "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
+    "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+    "hair drier", "toothbrush",
+)
+
+VOC_NAMES: tuple[str, ...] = (
+    "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus",
+    "car", "cat", "chair", "cow", "diningtable", "dog", "horse", "motorbike",
+    "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor",
+)
+
+
+def load_class_names(path: str) -> list[str]:
+    """One label per line; blank lines and ``#`` comments are ignored."""
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.is_absolute():
+        from .config import PROJECT_ROOT
+
+        p = PROJECT_ROOT / p
+    names: list[str] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if text and not text.startswith("#"):
+            names.append(text)
+    return names
+
+
+def wanted_label(
+    label: str,
+    confidence: float,
+    objects: set[str],
+    conf_threshold: float,
+    min_object_confidence: float,
+) -> str | None:
+    """Decide if a detection is one of the things this pipeline tracks.
+
+    * ``person`` must clear the normal ``conf_threshold`` (people are what the
+      behaviour rules are built on);
+    * the classes listed in ``detector.object_classes`` only need
+      ``min_object_confidence`` - a small bottle is much harder to see than a
+      standing human, and the object-ID stage tolerates that;
+    * everything else is dropped, so the tracker is not flooded with chairs.
+
+    Returns the label to keep, or ``None`` to drop the detection.
+    """
+    if label == "person":
+        return label if confidence >= conf_threshold else None
+    if objects and label.lower() in objects:
+        return label if confidence >= min_object_confidence else None
+    return None
+
+
 class OnnxDetector(BaseDetector):
-    """YOLO-style ONNX model loaded through OpenCV's DNN module."""
+    """YOLO-style ONNX model loaded through OpenCV's DNN module.
+
+    Detects **persons and objects**: class ``person`` uses ``conf_threshold``,
+    the classes listed in ``detector.object_classes`` (bottle, handbag, ...)
+    use ``min_object_confidence`` and carry their label, which is what the
+    object-ID stage tracks. Everything else is dropped.
+    """
 
     name = "onnx"
 
@@ -279,6 +353,10 @@ class OnnxDetector(BaseDetector):
             raise ValueError("detector.backend = 'onnx' requires detector.model (path to .onnx)")
         self.net = cv2.dnn.readNetFromONNX(cfg.model)
         self.layout = getattr(cfg, "layout", "auto")
+        self.names: list[str] = (
+            load_class_names(cfg.class_names) if cfg.class_names else list(COCO_NAMES)
+        )
+        self.objects = {n.lower() for n in (cfg.object_classes or [])}
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         h, w = frame.shape[:2]
@@ -292,7 +370,9 @@ class OnnxDetector(BaseDetector):
         )
         self.net.setInput(blob)
         out = self.net.forward()
-        boxes, scores, _ = decode_yolo(out, self.cfg.conf_threshold, self.layout)
+        # objects are allowed a lower bar than people, so decode from the lower one
+        decode_at = min(self.cfg.conf_threshold, self.cfg.min_object_confidence)
+        boxes, scores, class_ids = decode_yolo(out, decode_at, self.layout)
         if boxes.size == 0:
             return []
 
@@ -308,11 +388,20 @@ class OnnxDetector(BaseDetector):
         idx = cv2.dnn.NMSBoxes(
             xywh.tolist(),
             scores.astype(float).tolist(),
-            self.cfg.conf_threshold,
+            decode_at,
             self.cfg.nms_threshold,
         )
         out_dets: list[Detection] = []
         for i in np.array(idx).ravel() if len(idx) else []:
+            cid = int(class_ids[i])
+            label = self.names[cid] if 0 <= cid < len(self.names) else f"class_{cid}"
+            conf = float(scores[i])
+            keep = wanted_label(
+                label, conf, self.objects,
+                self.cfg.conf_threshold, self.cfg.min_object_confidence,
+            )
+            if keep is None:
+                continue
             cx, cy, bw, bh = xywh[i]
             box = (
                 int(cx - bw / 2),
@@ -321,13 +410,18 @@ class OnnxDetector(BaseDetector):
                 int(cy + bh / 2),
             )
             out_dets.append(
-                Detection(box=_clip(box, frame), confidence=float(scores[i]))
+                Detection(box=_clip(box, frame), confidence=conf, label=keep)
             )
         return out_dets
 
 
 class CaffeDetector(BaseDetector):
-    """MobileNet-SSD (person is class index 15)."""
+    """MobileNet-SSD (VOC classes: person is index 15).
+
+    Emits persons plus any ``detector.object_classes`` entry that exists in
+    VOC (``bottle`` is the useful one for a shop) so the object-ID stage has
+    something to work with.
+    """
 
     name = "caffe"
     PERSON_CLASS = 15
@@ -340,6 +434,10 @@ class CaffeDetector(BaseDetector):
                 "and detector.weights (caffemodel)"
             )
         self.net = cv2.dnn.readNetFromCaffe(cfg.model, cfg.weights)
+        self.names: list[str] = (
+            load_class_names(cfg.class_names) if cfg.class_names else list(VOC_NAMES)
+        )
+        self.objects = {n.lower() for n in (cfg.object_classes or [])}
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         h, w = frame.shape[:2]
@@ -353,7 +451,12 @@ class CaffeDetector(BaseDetector):
         for det in pred:
             cls_id = int(det[1])
             conf = float(det[2])
-            if cls_id != self.PERSON_CLASS or conf < self.cfg.conf_threshold:
+            label = self.names[cls_id] if 0 <= cls_id < len(self.names) else f"class_{cls_id}"
+            keep = wanted_label(
+                label, conf, self.objects,
+                self.cfg.conf_threshold, self.cfg.min_object_confidence,
+            )
+            if keep is None:
                 continue
             box = (
                 int(det[3] * w),
@@ -361,7 +464,7 @@ class CaffeDetector(BaseDetector):
                 int(det[5] * w),
                 int(det[6] * h),
             )
-            out.append(Detection(box=_clip(box, frame), confidence=conf))
+            out.append(Detection(box=_clip(box, frame), confidence=conf, label=keep))
         return _nms(out, self.cfg.nms_threshold)
 
 

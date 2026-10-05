@@ -45,6 +45,16 @@ DEFAULT_RULES: dict[str, dict[str, Any]] = {
         "person_grace_seconds": 8.0,
         "settle_seconds": 20.0,
     },
+    "object_taken": {
+        # needs the object-ID stage (onnx/caffe detectors): a thing that sat
+        # on a shelf is picked up and leaves its spot / disappears while held
+        "enabled": True,
+        "zone_kinds": ["shelf", "register"],
+        "min_carry_seconds": 2.0,
+        "leave_margin": 60,
+        "carrier_margin": 80,
+        "move_ratio": 0.35,
+    },
     "unattended_object": {
         "enabled": True,
         "zone_kinds": ["shelf", "register"],
@@ -105,14 +115,30 @@ class DetectorConfig:
     max_aspect_ratio: float = 1.60
     min_fill_ratio: float = 0.30
     warmup_frames: int = 3
+    # YOLO object detection: which non-person classes are tracked as "things
+    # people can take". Empty list = persons only.
+    class_names: str = ""                 # optional file, one label per line
+    object_classes: list[str] = field(
+        default_factory=lambda: [
+            "bottle", "cup", "handbag", "backpack", "book",
+            "cell phone", "scissors", "teddy bear", "suitcase",
+        ]
+    )
+    min_object_confidence: float = 0.35   # lower than conf_threshold: a bottle is
+                                          # much smaller than a person to detect
 
 
 @dataclass
 class TrackingConfig:
-    iou_threshold: float = 0.30
-    max_misses: int = 20
-    min_hits: int = 3
-    min_iou_new_track: float = 0.0    # reserved
+    algorithm: str = "bytetrack"       # iou | bytetrack | botsort
+    iou_threshold: float = 0.30        # legacy "iou"/SORT tracker only
+    max_misses: int = 20               # frames a lost track is kept for
+    min_hits: int = 3                  # matches before a track is reported
+    min_iou_new_track: float = 0.0     # reserved
+    # ByteTrack / BoT-SORT
+    track_thresh: float = 0.50         # >= high score, < low score (still used!)
+    reid_threshold: float = 0.55       # BoT-SORT appearance similarity 0..1
+    reid_max_distance: float = 180.0   # px - how far a ReID match may jump
 
 
 @dataclass
@@ -125,10 +151,23 @@ class AlertConfig:
 
 
 @dataclass
+class ConfidenceConfig:
+    """The "theft confidence" stage: fuse rule hits into one score per zone."""
+
+    enabled: bool = True
+    report_threshold: float = 0.60      # crossing this raises an alert
+    warn_threshold: float = 0.35        # HUD turns amber from here
+    decay_seconds: float = 45.0         # how fast suspicion fades away
+    reset_ratio: float = 0.5            # re-arm after falling below threshold*ratio
+    weights: dict = field(default_factory=dict)   # rule -> weight (overrides)
+
+
+@dataclass
 class Config:
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     alerts: AlertConfig = field(default_factory=AlertConfig)
+    confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     zones: list[Zone] = field(default_factory=list)
     rules: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -153,6 +192,7 @@ class Config:
         _apply_section(cfg.detector, data.get("detector", {}), "detector")
         _apply_section(cfg.tracking, data.get("tracking", {}), "tracking")
         _apply_section(cfg.alerts, data.get("alerts", {}), "alerts")
+        _apply_section(cfg.confidence, data.get("confidence", {}), "confidence")
 
         cfg.zones = [Zone.from_dict(z) for z in data.get("zones", [])]
 
@@ -174,6 +214,7 @@ class Config:
             "detector": asdict(self.detector),
             "tracking": asdict(self.tracking),
             "alerts": asdict(self.alerts),
+            "confidence": asdict(self.confidence),
             "zones": [
                 {"name": z.name, "kind": z.kind, "severity": z.severity, "points": z.points}
                 for z in self.zones

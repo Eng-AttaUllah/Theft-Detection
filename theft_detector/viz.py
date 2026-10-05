@@ -31,6 +31,28 @@ def draw_tracks(frame: np.ndarray, tracks: list[Track]) -> None:
         cv2.circle(frame, (fx, fy), 4, (0, 255, 0), -1)
 
 
+def draw_objects(frame: np.ndarray, objects: list) -> None:
+    """Cyan/amber boxes for tracked objects; red once they are gone."""
+    colors = {
+        "on_shelf": (255, 255, 0),
+        "carried": (0, 165, 255),
+        "moved": (255, 0, 255),
+        "idle": (200, 200, 200),
+        "gone": (0, 0, 255),
+    }
+    for o in objects:
+        x1, y1, x2, y2 = o.box
+        state = o.state if o.alive else "gone"
+        color = colors.get(state, (255, 255, 0))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        who = f" <-#{o.carrier}" if o.carrier and state == "carried" else ""
+        cv2.putText(
+            frame, f"{o.label}#{o.object_id} {state}{who}",
+            (x1, min(frame.shape[0] - 6, y2 + 16)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA,
+        )
+
+
 def draw_hud(
     frame: np.ndarray,
     *,
@@ -40,18 +62,42 @@ def draw_hud(
     alert_count: int,
     recent: deque,
     zones_busy: set[str],
+    tracker: str = "iou",
+    theft: float = 0.0,
+    theft_level: str = "clear",
+    objects: int = 0,
 ) -> None:
     h, w = frame.shape[:2]
     bar_h = 34
     cv2.rectangle(frame, (0, 0), (w, bar_h), (20, 20, 20), -1)
-    hud = f"FPS {fps:4.1f}   persons {people}   detector {backend}   alerts {alert_count}"
+    hud = (
+        f"FPS {fps:4.1f}   persons {people}   objects {objects}   "
+        f"{backend}/{tracker}   alerts {alert_count}"
+    )
     cv2.putText(
         frame, hud, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA
     )
+
+    # theft confidence: a live bar that turns amber, then red
+    score = max(0.0, min(1.0, theft))
+    x0, y0, bw, bh = w - 216, 12, 160, 10
+    cv2.rectangle(frame, (x0, y0), (x0 + bw, y0 + bh), (60, 60, 60), -1)
+    fill = int(bw * score)
+    if fill > 0:
+        color = (0, 0, 255) if theft_level == "high" else (
+            (0, 165, 255) if theft_level == "elevated" else (0, 200, 200)
+        )
+        cv2.rectangle(frame, (x0, y0), (x0 + fill, y0 + bh), color, -1)
+    cv2.rectangle(frame, (x0, y0), (x0 + bw, y0 + bh), (150, 150, 150), 1)
+    cv2.putText(
+        frame, f"theft {score:.2f}", (x0 + bw + 8, y0 + bh + 3),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA,
+    )
+
     if zones_busy:
         text = "IN ZONE: " + ", ".join(sorted(zones_busy))
         cv2.putText(
-            frame, text, (w - 10 - int(0.55 * len(text) * 11), 24),
+            frame, text, (w - 10 - int(0.55 * len(text) * 11), 30),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA,
         )
 

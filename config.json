@@ -2,10 +2,15 @@
   "detector": {
     "backend": "hog",
     "conf_threshold": 0.40,
+    "min_object_confidence": 0.35,
     "model": "",
     "weights": ""
   },
   "tracking": {
+    "algorithm": "bytetrack",
+    "track_thresh": 0.50,
+    "reid_threshold": 0.55,
+    "reid_max_distance": 180.0,
     "iou_threshold": 0.30,
     "max_misses": 20,
     "min_hits": 3
@@ -15,6 +20,13 @@
     "cooldown_seconds": 8.0,
     "save_snapshots": true,
     "beep": true
+  },
+  "confidence": {
+    "enabled": true,
+    "report_threshold": 0.60,
+    "warn_threshold": 0.35,
+    "decay_seconds": 45.0,
+    "reset_ratio": 0.5
   },
   "zones": [
     {
@@ -65,6 +77,7 @@
       "diff_threshold": 28,
       "change_ratio": 0.010,
       "largest_change_ratio": 0.015,
+      "min_blob_coherence": 0.80,
       "hold_frames": 10,
       "person_grace_seconds": 8.0,
       "settle_seconds": 20.0,
@@ -80,6 +93,14 @@
       "zone_kinds": ["shelf", "register"],
       "hold_frames": 30,
       "unattended_seconds": 10.0
+    },
+    "object_taken": {
+      "enabled": true,
+      "zone_kinds": ["shelf", "register"],
+      "min_carry_seconds": 2.0,
+      "leave_margin": 60,
+      "carrier_margin": 80,
+      "move_ratio": 0.35
     },
     "rapid_motion": {
       "enabled": true,

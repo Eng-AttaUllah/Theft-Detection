@@ -19,10 +19,34 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from theft_detector.alerts import Event                      # noqa: E402
-from theft_detector.behaviors import ZoneBackgrounds         # noqa: E402
-from theft_detector.config import Config, TrackingConfig     # noqa: E402
-from theft_detector.detectors import Detection, decode_yolo  # noqa: E402
-from theft_detector.tracker import Tracker                   # noqa: E402
+from theft_detector.behaviors import (                       # noqa: E402
+    FrameContext,
+    ObjectTakenRule,
+    ZoneBackgrounds,
+)
+from theft_detector.bytetrack import (                       # noqa: E402
+    BoTSortTracker,
+    ByteTracker,
+    KalmanBox,
+    appearance,
+    build_tracker,
+    similarity,
+)
+from theft_detector.confidence import TheftConfidence        # noqa: E402
+from theft_detector.config import (                          # noqa: E402
+    ConfidenceConfig,
+    Config,
+    TrackingConfig,
+)
+from theft_detector.detectors import (                     # noqa: E402
+    COCO_NAMES,
+    VOC_NAMES,
+    Detection,
+    decode_yolo,
+    wanted_label,
+)
+from theft_detector.objects import ObjectTracker             # noqa: E402
+from theft_detector.tracker import Tracker, Track            # noqa: E402
 from theft_detector.zones import Zone                        # noqa: E402
 
 
@@ -190,6 +214,30 @@ class ZoneBackgroundTest(unittest.TestCase):
 
         state = self._run(8, frame, person_mask, tracks, start=5)
         self.assertEqual(state.changed_run, 0)
+
+    def test_scattered_change_is_not_one_object(self) -> None:
+        """A person-shaped ghost plus noise fragments must not start an episode.
+
+        The total changed area can be huge and still be somebody moving about;
+        only ONE coherent blob reads as "an object disappeared". On the demo
+        clip the real removal scores coherence ~1.0 and the person-shaped
+        false positive ~0.7.
+        """
+        base = np.full((200, 200), 100, np.uint8)
+        mask = np.zeros((200, 200), np.uint8)
+        self._run(5, base, mask, [], start=0)
+
+        scattered = base.copy()
+        scattered[60:150, 100:140] = 210      # tall person-shaped blob, 3600 px
+        scattered[45:75, 45:70] = 210          # ...plus fragments around the zone
+        scattered[130:158, 45:70] = 210
+        scattered[45:75, 145:158] = 210
+
+        state = self._run(8, scattered, mask, [], start=5)
+        self.assertGreater(state.changed_ratio, 0.010)      # plenty of pixels
+        self.assertGreater(state.largest_ratio, 0.015)      # one big blob too
+        self.assertLess(state.coherence, 0.80)              # ...but fragmented
+        self.assertEqual(state.changed_run, 0)              # so: not a change
 
     def test_lost_track_footprint_is_not_a_change(self) -> None:
         """A motion detector drops people when they stand still - as long as
@@ -521,6 +569,418 @@ class EndToEndTest(unittest.TestCase):
             count = pipe.run()
             self.assertGreater(pipe.frame_index, 80)
             self.assertGreaterEqual(count, 0)
+
+            # stage 2: ByteTrack is the default tracker ...
+            from theft_detector.bytetrack import ByteTracker
+            from theft_detector.confidence import Assessment
+
+            self.assertIsInstance(pipe.tracker, ByteTracker)
+            # stage 3: the object-id stage is wired in (motion sees no objects)
+            self.assertIsInstance(pipe.object_tracker, ObjectTracker)
+            self.assertEqual(pipe.object_tracker.objects, {})
+            # stage 5: every frame is fused into one score
+            self.assertIsInstance(pipe.assessment, Assessment)
+            self.assertGreaterEqual(pipe.assessment.score, 0.0)
+            self.assertLessEqual(pipe.assessment.score, 1.0)
+            self.assertIn(pipe.assessment.level, {"clear", "low", "elevated", "high"})
+
+
+# --------------------------------------------------------------------------- #
+class DetectionSelectionTest(unittest.TestCase):
+    """Which classes reach the trackers (stage 1 -> stage 3 hand-off)."""
+
+    OBJECTS = {"bottle", "handbag"}
+
+    def test_persons_need_the_full_threshold(self) -> None:
+        self.assertEqual(wanted_label("person", 0.45, self.OBJECTS, 0.4, 0.35), "person")
+        self.assertIsNone(wanted_label("person", 0.3, self.OBJECTS, 0.4, 0.35))
+
+    def test_objects_use_their_own_lower_bar(self) -> None:
+        self.assertEqual(wanted_label("bottle", 0.36, self.OBJECTS, 0.4, 0.35), "bottle")
+        self.assertIsNone(wanted_label("bottle", 0.2, self.OBJECTS, 0.4, 0.35))
+
+    def test_unlisted_classes_are_dropped(self) -> None:
+        self.assertIsNone(wanted_label("toaster", 0.99, self.OBJECTS, 0.4, 0.35))
+
+    def test_object_detection_can_be_switched_off(self) -> None:
+        self.assertIsNone(wanted_label("bottle", 0.99, set(), 0.4, 0.35))
+
+    def test_object_names_are_case_insensitive(self) -> None:
+        self.assertEqual(wanted_label("Handbag", 0.9, {"handbag"}, 0.4, 0.35), "Handbag")
+
+    def test_class_orders_match_the_models(self) -> None:
+        self.assertEqual(COCO_NAMES[0], "person")     # YOLO
+        self.assertEqual(VOC_NAMES[15], "person")     # MobileNet-SSD
+        self.assertIn("bottle", COCO_NAMES)
+        self.assertIn("bottle", VOC_NAMES)
+        self.assertEqual(len(COCO_NAMES), 80)
+
+
+# --------------------------------------------------------------------------- #
+class ByteTrackTest(unittest.TestCase):
+    """Three-stage association + Kalman: ids must not flicker."""
+
+    @staticmethod
+    def make(**kw) -> ByteTracker:
+        kw.setdefault("min_hits", 3)
+        return ByteTracker(TrackingConfig(**kw))
+
+    # ------------------------------------------------------------------ #
+    def test_factory_picks_the_algorithm(self) -> None:
+        self.assertIsInstance(build_tracker(TrackingConfig(algorithm="iou")), Tracker)
+        self.assertIsInstance(
+            build_tracker(TrackingConfig(algorithm="bytetrack")), ByteTracker
+        )
+        self.assertIsInstance(
+            build_tracker(TrackingConfig(algorithm="botsort")), BoTSortTracker
+        )
+        with self.assertRaises(ValueError):
+            build_tracker(TrackingConfig(algorithm="nope"))
+
+    def test_kalman_predicts_and_tracks_velocity(self) -> None:
+        kf = KalmanBox((100, 100, 140, 240))
+        self.assertEqual(kf.box, (100, 100, 140, 240))
+        kf.x[4] = 10.0                       # 10 px/frame to the right
+        pred = kf.predict()
+        self.assertAlmostEqual(pred[0], 110, delta=2)            # x1 slid right
+        self.assertAlmostEqual(pred[2] - pred[0], 40, delta=2)   # width kept
+        kf.update((110, 100, 140, 240))
+        self.assertAlmostEqual(kf.box[0], 110, delta=3)
+        self.assertGreater(kf.velocity[0], 0.0)            # motion model kept
+
+    # ------------------------------------------------------------------ #
+    def test_id_survives_blur_and_occlusion(self) -> None:
+        tr = self.make()
+        ids: set[int] = set()
+        for i in range(60):
+            if i in (25, 26):                # two frames of full occlusion
+                dets: list[Detection] = []
+            else:
+                x = 100 + i * 6
+                conf = 0.6 if i % 10 else 0.25   # every 10th frame: blurred
+                dets = [Detection(box=(x, 100, x + 80, 300), confidence=conf)]
+            tr.update(dets, i / 30.0)
+            ids |= {t.track_id for t in tr.confirmed()}
+        self.assertEqual(ids, {1})
+
+    def test_low_score_dets_never_start_a_track(self) -> None:
+        tr = self.make(min_hits=1)
+        tr.update([Detection(box=(0, 0, 50, 150), confidence=0.2)], 0.0)
+        self.assertEqual(tr.confirmed(), [])
+
+    def test_min_hits_gates_confirmation(self) -> None:
+        tr = self.make(min_hits=3)
+        for i in range(2):
+            tr.update([Detection(box=(0, 0, 50, 150), confidence=0.9)], i / 30.0)
+        self.assertEqual(tr.confirmed(), [])
+        tr.update([Detection(box=(0, 0, 50, 150), confidence=0.9)], 2 / 30.0)
+        self.assertEqual(len(tr.confirmed()), 1)
+
+    def test_two_walkers_keep_their_ids_through_the_crossing(self) -> None:
+        tr = self.make()
+        for i in range(60):
+            a = 50 + i * 8                   # walker A: left -> right (id 1)
+            b = 850 - i * 8                  # walker B: right -> left (id 2)
+            tr.update(
+                [
+                    Detection(box=(a, 100, a + 80, 300), confidence=0.8),
+                    Detection(box=(b, 100, b + 80, 300), confidence=0.8),
+                ],
+                i / 30.0,
+            )
+        by_id = {t.track_id: t.box[0] for t in tr.confirmed()}
+        self.assertEqual(set(by_id), {1, 2})          # no id was minted or lost
+        self.assertGreater(by_id[1], by_id[2])        # they did not swap
+
+    def test_track_dies_after_max_misses(self) -> None:
+        tr = self.make(min_hits=1, max_misses=2)
+        for i in range(3):
+            tr.update([Detection(box=(0, 0, 50, 150), confidence=0.9)], i / 30.0)
+        tr.update([], 3 / 30.0)
+        tr.update([], 4 / 30.0)
+        self.assertEqual(len(tr.output()), 1)         # still within budget
+        tr.update([], 5 / 30.0)
+        tr.update([], 6 / 30.0)
+        self.assertEqual(len(tr.output()), 0)
+
+    def test_track_labels_come_from_the_detection(self) -> None:
+        tr = self.make(min_hits=1)
+        tr.update([Detection(box=(0, 0, 50, 150), confidence=0.9, label="bottle")], 0.0)
+        self.assertEqual(tr.output()[0].label, "bottle")
+
+
+# --------------------------------------------------------------------------- #
+class ReidTest(unittest.TestCase):
+    """BoT-SORT's appearance re-identification."""
+
+    @staticmethod
+    def frame() -> np.ndarray:
+        f = np.full((400, 1200, 3), 70, np.uint8)
+        f[100:340, 300:380] = (30, 30, 200)       # person A: red shirt
+        f[100:340, 800:880] = (200, 60, 30)       # person B: blue shirt
+        return f
+
+    def test_appearance_similarity(self) -> None:
+        frame = self.frame()
+        red = appearance((300, 100, 380, 340), frame)
+        blue = appearance((800, 100, 880, 340), frame)
+        self.assertGreater(similarity(red, red), 0.99)
+        self.assertLess(similarity(red, blue), 0.5)
+        self.assertIsNone(appearance((0, 0, 2, 2), frame))
+        self.assertEqual(similarity(None, red), 0.0)
+
+    def test_recovers_a_lost_track_within_the_distance_limit(self) -> None:
+        # a plain frame: the point here is the *mechanism* (no IoU left ->
+        # appearance + distance limit must bring the id back)
+        frame = np.full((400, 1200, 3), 70, np.uint8)
+        bt = BoTSortTracker(TrackingConfig(min_hits=2))
+        for i in range(30):                     # A walks 5 px/frame
+            x = 100 + i * 5
+            bt.update(
+                [Detection(box=(x, 100, x + 80, 340), confidence=0.75)], i / 30.0, frame
+            )
+        self.assertEqual(bt.live_ids(), {1})
+        for k in range(3):                      # hidden behind a pillar
+            bt.update([], (30 + k) / 30.0, frame)
+        # reappears 155 px on: no IoU left, still inside reid_max_distance
+        bt.update([Detection(box=(400, 100, 480, 340), confidence=0.75)], 35 / 30.0, frame)
+        self.assertEqual(bt.live_ids(), {1})     # same id, no #2 minted
+        confirmed = bt.confirmed()               # and it is really back: misses == 0
+        self.assertEqual([t.track_id for t in confirmed], [1])
+        self.assertEqual(confirmed[0].misses, 0)
+
+    def test_refuses_to_teleport_a_track(self) -> None:
+        frame = self.frame()
+        bt = BoTSortTracker(TrackingConfig(min_hits=2))
+        for i in range(30):
+            x = 100 + i * 5
+            bt.update(
+                [Detection(box=(x, 100, x + 80, 340), confidence=0.75)], i / 30.0, frame
+            )
+        for k in range(3):
+            bt.update([], (30 + k) / 30.0, frame)
+        # 755 px away: appearance matches but that is a teleport -> new id
+        bt.update([Detection(box=(1000, 100, 1080, 340), confidence=0.75)], 35 / 30.0, frame)
+        self.assertEqual(bt.live_ids(), {1, 2})
+
+    def test_without_a_frame_it_behaves_like_bytetrack(self) -> None:
+        bt = BoTSortTracker(TrackingConfig(min_hits=2))
+        for i in range(10):
+            x = 100 + i * 5
+            bt.update([Detection(box=(x, 100, x + 80, 340), confidence=0.75)], i / 30.0)
+        self.assertIsNone(bt.stracks[0].feat)
+
+
+# --------------------------------------------------------------------------- #
+class ObjectStageTest(unittest.TestCase):
+    """Person ID + object ID: what the object tracker contributes."""
+
+    def setUp(self) -> None:
+        self.zone = Zone(
+            name="shelf_a",
+            points=[(0.1, 0.1), (0.5, 0.1), (0.5, 0.6), (0.1, 0.6)],
+            kind="shelf",
+        )
+        self.zone.resolve(640, 480)
+        self.ot = ObjectTracker(TrackingConfig(min_hits=2))
+
+    @staticmethod
+    def bottle(x1: int, y1: int) -> Detection:
+        return Detection(box=(x1, y1, x1 + 100, y1 + 80), confidence=0.8, label="bottle")
+
+    @staticmethod
+    def person(track_id: int, x1: int, y1: int) -> Track:
+        return Track(
+            track_id=track_id, box=(x1, y1, x1 + 170, y1 + 320), hits=5, misses=0
+        )
+
+    def _ctx(self, objects, tracks, ts: float) -> FrameContext:
+        return FrameContext(
+            frame=np.zeros((480, 640, 3), np.uint8),
+            gray=np.zeros((480, 640), np.uint8),
+            timestamp=ts,
+            frame_index=0,
+            fps=30.0,
+            zones=[self.zone],
+            tracks=tracks,
+            objects=objects,
+        )
+
+    # ------------------------------------------------------------------ #
+    def test_no_object_detections_means_nothing_happens(self) -> None:
+        ot = ObjectTracker(TrackingConfig(min_hits=1))
+        self.assertEqual(ot.update([], [], [], 0.0), [])
+        self.assertEqual(ot.objects, {})
+
+    def test_object_sitting_on_a_shelf_is_anchored_there(self) -> None:
+        det = self.bottle(120, 120)              # centre (170, 160) is in the zone
+        self.assertEqual(self.ot.update([det], [], [self.zone], 0.0), [])
+        objs = self.ot.update([det], [], [self.zone], 0.1)
+        self.assertEqual(len(objs), 1)
+        obj = objs[0]
+        self.assertTrue(obj.alive)
+        self.assertEqual(obj.anchor_zone, "shelf_a")
+        self.assertEqual(obj.state, "on_shelf")
+        self.assertIsNone(obj.carrier)
+
+    def test_a_person_picks_it_up(self) -> None:
+        det = self.bottle(120, 120)
+        self.ot.update([det], [], [self.zone], 0.0)
+        self.ot.update([det], [], [self.zone], 0.1)
+        guy = self.person(7, 150, 80)            # box contains the bottle
+        moved = self.bottle(180, 130)
+        objs = self.ot.update([moved], [guy], [self.zone], 1.0)
+        self.assertEqual(objs[0].carrier, 7)
+        self.assertAlmostEqual(objs[0].carried_since or -1, 1.0)
+        objs = self.ot.update([moved], [guy], [self.zone], 1.5)
+        self.assertEqual(objs[0].state, "carried")
+        self.assertEqual(objs[0].carrier, 7)
+
+    def test_it_is_adopted_only_after_min_hits(self) -> None:
+        ot = ObjectTracker(TrackingConfig(min_hits=3))
+        det = self.bottle(120, 120)
+        self.assertEqual(ot.update([det], [], [self.zone], 0.0), [])
+        self.assertEqual(ot.update([det], [], [self.zone], 0.1), [])
+        self.assertEqual(len(ot.update([det], [], [self.zone], 0.2)), 1)
+
+    # ------------------------------------------------------------------ #
+    def _carry_out_of_zone(self) -> tuple[list, Track]:
+        """Walk the bottle (and the man holding it) from the shelf out of it."""
+        guy = self.person(7, 150, 80)
+        self.ot.update([self.bottle(120, 120)], [], [self.zone], 0.0)
+        self.ot.update([self.bottle(120, 120)], [], [self.zone], 0.1)
+        objs = self.ot.update([self.bottle(180, 130)], [guy], [self.zone], 1.0)
+        objs = self.ot.update([self.bottle(240, 130)], [guy], [self.zone], 1.5)
+        self.assertEqual(objs[0].state, "carried")
+        # ...and out: centres 170 -> 290 -> 350 -> 410, zone right edge is 320
+        objs = self.ot.update([self.bottle(300, 130)], [guy], [self.zone], 2.0)
+        self.assertEqual(len(objs), 1)
+        objs = self.ot.update([self.bottle(360, 130)], [guy], [self.zone], 2.5)
+        return objs, guy
+
+    def test_rule_fires_when_it_leaves_the_shelf(self) -> None:
+        objs, guy = self._carry_out_of_zone()
+        rule = ObjectTakenRule(
+            {"zone_kinds": ["shelf"], "min_carry_seconds": 1.0, "leave_margin": 60}, {}
+        )
+        events = rule.update(self._ctx(objs, [guy], 2.5))
+        self.assertEqual(len(events), 1)
+        ev = events[0]
+        self.assertEqual(ev.rule, "object_taken")
+        self.assertEqual(ev.zone, "shelf_a")
+        self.assertEqual(ev.track_ids, [guy.track_id])   # the person, not the object
+        self.assertIn("left", ev.message)
+        self.assertEqual(rule.update(self._ctx(objs, [guy], 2.6)), [])   # once only
+
+    def test_rule_fires_when_it_disappears_while_held(self) -> None:
+        guy = self.person(7, 150, 80)
+        det = self.bottle(120, 120)
+        self.ot.update([det], [], [self.zone], 0.0)
+        self.ot.update([det], [], [self.zone], 0.1)
+        objs = self.ot.update([det], [guy], [self.zone], 1.0)
+        objs = self.ot.update([det], [guy], [self.zone], 1.5)
+        self.ot.update([], [], [self.zone], 2.0)        # taken out of view
+        objs = self.ot.update([], [], [self.zone], 2.5)
+        self.assertFalse(objs[0].alive)
+        rule = ObjectTakenRule(
+            {"zone_kinds": ["shelf"], "min_carry_seconds": 1.0, "leave_margin": 60}, {}
+        )
+        events = rule.update(self._ctx(objs, [], 2.5))
+        self.assertEqual(len(events), 1)
+        self.assertIn("disappeared while held", events[0].message)
+
+    def test_object_that_never_started_on_a_shelf_is_ignored(self) -> None:
+        # planted mid-air, nowhere near a shelf zone
+        ot = ObjectTracker(TrackingConfig(min_hits=1))
+        det = Detection(box=(500, 400, 600, 460), confidence=0.8, label="bottle")
+        objs = ot.update([det], [], [self.zone], 0.0)
+        self.assertIsNone(objs[0].anchor_zone)
+        rule = ObjectTakenRule(
+            {"zone_kinds": ["shelf"], "min_carry_seconds": 0.0, "leave_margin": 0}, {}
+        )
+        self.assertEqual(rule.update(self._ctx(objs, [], 1.0)), [])
+        # with nothing at all the rule stays silent too (hog/motion backends)
+        self.assertEqual(
+            rule.update(self._ctx([], [], 2.0)),
+            [],
+        )
+
+
+# --------------------------------------------------------------------------- #
+class ConfidenceTest(unittest.TestCase):
+    """The theft-confidence fusion stage."""
+
+    @staticmethod
+    def feed(f: TheftConfidence, rule: str, conf: float = 1.0,
+             sev: str = "medium", zone: str | None = None, ts: float = 0.0):
+        return f.update(
+            [Event(rule=rule, severity=sev, message="x", timestamp=ts,
+                   confidence=conf, zone=zone)],
+            ts,
+        )
+
+    def test_a_single_weak_signal_stays_quiet(self) -> None:
+        f = TheftConfidence(ConfidenceConfig())
+        a = self.feed(f, "restricted_zone", 1.0, ts=6.0)
+        self.assertLess(a.score, f.cfg.report_threshold)
+        self.assertFalse(a.reported)
+        self.assertEqual(a.level, "low")
+
+    def test_evidence_accumulates_and_fires_exactly_once(self) -> None:
+        f = TheftConfidence(ConfidenceConfig())
+        self.feed(f, "restricted_zone", ts=6.0)
+        self.feed(f, "rapid_motion", conf=0.7, ts=13.0)
+        a = self.feed(f, "item_removal", conf=1.0, zone="shelf_a", ts=16.0)
+        self.assertTrue(a.reported)
+        ev = a.event
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.rule, "theft_confidence")
+        self.assertEqual(ev.severity, "high")
+        self.assertEqual(ev.zone, "shelf_a")
+        self.assertGreaterEqual(ev.confidence, f.cfg.report_threshold)
+        self.assertIn("item_removal", ev.message)
+        self.assertIn("restricted_zone", ev.message)
+        # hysteresis: no second alert while the score is still high
+        b = f.update([], 17.0)
+        self.assertFalse(b.reported)
+        self.assertAlmostEqual(b.score, a.score, delta=0.02)
+
+    def test_it_decays_back_to_clear_and_can_fire_again(self) -> None:
+        f = TheftConfidence(ConfidenceConfig())
+        self.feed(f, "item_removal", ts=16.0)
+        self.feed(f, "object_taken", ts=17.0)        # -> 0.9, fired
+        late = f.update([], 417.0)                   # 400 quiet seconds
+        self.assertEqual(late.score, 0.0)
+        self.assertEqual(f.level(), "clear")
+        self.assertIsNone(f.zone)                    # the incident is forgotten
+        self.feed(f, "item_removal", ts=418.0)
+        self.assertFalse(f.update([], 419.0).reported)   # re-armed, below bar
+        again = self.feed(f, "object_taken", ts=420.0)
+        self.assertTrue(again.reported)                   # and fires again
+
+    def test_disabled_config_is_inert(self) -> None:
+        f = TheftConfidence(ConfidenceConfig(enabled=False))
+        a = self.feed(f, "item_removal", ts=1.0)
+        self.assertEqual(a.score, 0.0)
+        self.assertFalse(a.reported)
+
+    def test_unknown_rule_contributes_nothing(self) -> None:
+        f = TheftConfidence(ConfidenceConfig())
+        self.assertEqual(self.feed(f, "not_a_rule", ts=1.0).score, 0.0)
+
+    def test_its_own_alert_is_not_reingested(self) -> None:
+        f = TheftConfidence(ConfidenceConfig())
+        a = f.update(
+            [Event(rule="theft_confidence", severity="high", message="m",
+                   timestamp=0.0, confidence=1.0)],
+            0.0,
+        )
+        self.assertEqual(a.score, 0.0)
+
+    def test_weights_are_overridable(self) -> None:
+        f = TheftConfidence(ConfidenceConfig(weights={"item_removal": 1.0}))
+        a = self.feed(f, "item_removal", sev="high", ts=1.0)
+        self.assertGreater(a.score, 0.9)
 
 
 if __name__ == "__main__":
